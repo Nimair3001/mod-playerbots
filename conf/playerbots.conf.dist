@@ -1728,14 +1728,20 @@ AiPlayerbot.MaxRandomBotInWorldTime = 28800
 # Minimum and maximum seconds a randombot stays offline after a periodic logout
 # before it is eligible for normal login again.
 # These settings only apply when EnablePeriodicOnlineOffline is enabled.
-# Defaults: 600 (min), 28800 (max)
+# Set MaxRandomBotOfflineTime to 0 to disable the offline cooldown entirely; bots then become
+# eligible again as soon as they log out, which is how the module behaved before this setting existed.
+# If these options are missing from the config file, they fall back to MinRandomBotInWorldTime and
+# MaxRandomBotInWorldTime, so an older config keeps its previous timings.
 AiPlayerbot.MinRandomBotOfflineTime = 600
 AiPlayerbot.MaxRandomBotOfflineTime = 28800
 
 # If enabled and the normal periodic selection cannot fill all requested bot slots,
 # check the remaining RNDbot pool before breaking any cooldown. If every otherwise
 # eligible bot is still on offline cooldown, the bot that has been offline the longest
-# is allowed to log in early. The fallback runs only while filling missing bot slots.
+# is allowed to log in early. The fallback runs only while filling missing bot slots,
+# and at most once per minute because it queries every RNDbot account.
+# Note that this widens the selection beyond the subset PeriodicOnlineOfflineRatio picked, so with
+# a lasting bot shortage the rotation through the account pool is effectively bypassed.
 # Default: 0 (disabled)
 AiPlayerbot.RandomBotOfflineCooldownFallback = 0
 

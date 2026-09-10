@@ -251,12 +251,11 @@ bool PlayerbotAIConfig::Initialize()
         sConfigMgr->GetOption<int32>("AiPlayerbot.RandomBotCountChangeMaxInterval", 2 * HOUR);
     minRandomBotInWorldTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MinRandomBotInWorldTime", 2 * HOUR);
     maxRandomBotInWorldTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MaxRandomBotInWorldTime", 14 * 24 * HOUR);
-    minRandomBotOfflineTime =
-        sConfigMgr->GetOption<int32>("AiPlayerbot.MinRandomBotOfflineTime", minRandomBotInWorldTime);
-    maxRandomBotOfflineTime =
-        sConfigMgr->GetOption<int32>("AiPlayerbot.MaxRandomBotOfflineTime", maxRandomBotInWorldTime);
-    randomBotOfflineCooldownFallback =
-        sConfigMgr->GetOption<bool>("AiPlayerbot.RandomBotOfflineCooldownFallback", false);
+    // Missing offline timings fall back to the in-world timings, so an old config keeps its behavior.
+    minRandomBotOfflineTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MinRandomBotOfflineTime",
+                                                           static_cast<int32>(minRandomBotInWorldTime));
+    maxRandomBotOfflineTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MaxRandomBotOfflineTime",
+                                                           static_cast<int32>(maxRandomBotInWorldTime));
     minRandomBotRandomizeTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MinRandomBotRandomizeTime", 2 * HOUR);
     maxRandomBotRandomizeTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MaxRandomBotRandomizeTime", 14 * 24 * HOUR);
     minRandomBotChangeStrategyTime =
@@ -703,6 +702,8 @@ bool PlayerbotAIConfig::Initialize()
     limitGearExpansion = sConfigMgr->GetOption<int32>("AiPlayerbot.LimitGearExpansion", 1);
     randombotStartingLevel = sConfigMgr->GetOption<int32>("AiPlayerbot.RandombotStartingLevel", 1);
     enablePeriodicOnlineOffline = sConfigMgr->GetOption<bool>("AiPlayerbot.EnablePeriodicOnlineOffline", false);
+    randomBotOfflineCooldownFallback =
+        sConfigMgr->GetOption<bool>("AiPlayerbot.RandomBotOfflineCooldownFallback", false);
     enableRandomBotTrading = sConfigMgr->GetOption<int32>("AiPlayerbot.EnableRandomBotTrading", 1);
     periodicOnlineOfflineRatio = sConfigMgr->GetOption<float>("AiPlayerbot.PeriodicOnlineOfflineRatio", 2.0);
     gearscorecheck = sConfigMgr->GetOption<bool>("AiPlayerbot.GearScoreCheck", false);

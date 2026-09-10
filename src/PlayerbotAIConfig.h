@@ -164,7 +164,6 @@ public:
     uint32 randomBotUpdateInterval, randomBotCountChangeMinInterval, randomBotCountChangeMaxInterval;
     uint32 minRandomBotInWorldTime, maxRandomBotInWorldTime;
     uint32 minRandomBotOfflineTime, maxRandomBotOfflineTime;
-    bool randomBotOfflineCooldownFallback;
     uint32 minRandomBotRandomizeTime, maxRandomBotRandomizeTime;
     uint32 minRandomBotChangeStrategyTime, maxRandomBotChangeStrategyTime;
     uint32 minRandomBotReviveTime, maxRandomBotReviveTime;
@@ -312,6 +311,7 @@ public:
     uint32 limitGearExpansion;
     uint32 randombotStartingLevel;
     bool enablePeriodicOnlineOffline;
+    bool randomBotOfflineCooldownFallback;
     float periodicOnlineOfflineRatio;
     bool gearscorecheck;
     bool randomBotPreQuests;

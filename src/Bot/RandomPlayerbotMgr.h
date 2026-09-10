@@ -237,6 +237,8 @@ private:
     time_t printStatsTimer;
     uint32 AddRandomBots();
     bool ProcessBot(uint32 bot);
+    bool IsSafeToRetire(uint32 bot, Player* player, PlayerbotAI* botAI);
+    void SetOfflineCooldown(uint32 bot);
     void ScheduleRandomize(uint32 bot, uint32 time);
     void RandomTeleport(Player* bot);
     void RandomTeleport(Player* bot, std::vector<WorldLocation>& locs, bool hearth = false);
@@ -250,6 +252,11 @@ private:
     std::map<TeamId, std::map<BattlegroundTypeId, std::vector<uint32>>> BattleMastersCache;
     std::unordered_map<uint32, BotEventCache> eventCache;
     std::unordered_set<uint32> currentBots;
+
+    // Bot GUID -> time by which an expired but busy bot is retired anyway. Only holds entries for
+    // bots currently waiting to retire, and is deliberately not persisted: after a restart every bot
+    // starts over with a fresh "add" event.
+    std::unordered_map<uint32, uint32> retirementDeadlines;
     uint32 playersLevel;
 
     // Account lists

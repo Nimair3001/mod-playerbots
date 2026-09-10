@@ -18,6 +18,7 @@
 #include "FleeManager.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
+#include "Group.h"
 #include "LFGMgr.h"
 #include "MapMgr.h"
 #include "NewRpgInfo.h"
@@ -55,6 +56,44 @@ struct GuidClassRaceInfo
     uint32 rClass;
     uint32 rRace;
 };
+
+namespace
+{
+// Event name of the periodic offline cooldown. Deliberately not "logout": that name is still written
+// by Randomize()/RandomizeMin() with the in-world timings and was left behind by older versions, so
+// reusing it would make stale rows read as active cooldowns. Kept short on purpose, the name is
+// converted to std::string on every event lookup and stays inside the small string buffer this way.
+constexpr char PLAYERBOT_EVENT_OFFLINE_COOLDOWN[] = "offline_cd";
+
+// The offline cooldown fallback scans the whole RNDbot pool, so it is rate limited instead of running
+// on every manager tick.
+constexpr uint32 PLAYERBOT_OFFLINE_FALLBACK_INTERVAL = 60;
+
+// How long a bot whose in-world lifetime expired may stay online while it is busy. Without a deadline
+// a permanently grouped or endlessly queued bot would hold its population slot forever.
+constexpr uint32 PLAYERBOT_RETIREMENT_GRACE_PERIOD = 15 * MINUTE;
+
+// Delay before a bot that failed to log in is offered to the login selection again, so a character
+// that cannot be loaded does not get picked on every single tick.
+constexpr uint32 PLAYERBOT_LOGIN_ERROR_COOLDOWN = 5 * MINUTE;
+
+// True when at least one member other than "player" is a human controlled character.
+bool GroupHasRealPlayer(Player* player)
+{
+    Group* group = player->GetGroup();
+    if (!group)
+        return false;
+
+    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* member = ref->GetSource();
+        if (member != player && IsRealPlayer(member))
+            return true;
+    }
+
+    return false;
+}
+}  // namespace
 
 void PrintStatsThread() { sRandomPlayerbotMgr.PrintStats(); }
 
@@ -740,26 +779,64 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
                 hordeChars.push_back(charInfo);
         }
 
-        // Lambda to handle bot login logic
-        auto tryLoginBot = [&](CharacterInfo const& charInfo, bool ignoreOfflineCooldown = false) -> bool
+        struct OfflineCandidate
         {
-            if (GetEventValue(charInfo.guid, "add") ||
-                (!ignoreOfflineCooldown && GetEventValue(charInfo.guid, "logout")) ||
-                GetPlayerBot(charInfo.guid) ||
-                currentBots.contains(charInfo.guid) ||
-                (sPlayerbotAIConfig.disableDeathKnightLogin && charInfo.rClass == CLASS_DEATH_KNIGHT))
-            {
-                return false;
-            }
+            CharacterInfo character;
+            uint32 offlineSince;
+        };
 
+        // Candidates on offline cooldown are recorded while the normal phases run, so the optional
+        // fallback below never has to walk the character pool a second time.
+        bool const collectCooldownCandidates =
+            sPlayerbotAIConfig.enablePeriodicOnlineOffline && sPlayerbotAIConfig.randomBotOfflineCooldownFallback;
+
+        std::vector<OfflineCandidate> offlineCandidates;
+        std::unordered_set<uint32> collectedCandidates;
+
+        // Everything a bot must satisfy to be logged in, except the offline cooldown. Shared by the
+        // normal phases and the fallback so both can never drift apart.
+        auto isEligible = [&](CharacterInfo const& charInfo) -> bool
+        {
+            return !GetEventValue(charInfo.guid, "add") && !GetPlayerBot(charInfo.guid) &&
+                   !currentBots.contains(charInfo.guid) &&
+                   !(sPlayerbotAIConfig.disableDeathKnightLogin && charInfo.rClass == CLASS_DEATH_KNIGHT);
+        };
+
+        auto loginBot = [&](CharacterInfo const& charInfo)
+        {
             uint32 add_time = sPlayerbotAIConfig.enablePeriodicOnlineOffline
                                 ? urand(sPlayerbotAIConfig.minRandomBotInWorldTime,
                                         sPlayerbotAIConfig.maxRandomBotInWorldTime)
                                 : sPlayerbotAIConfig.permanentlyInWorldTime;
 
             SetEventValue(charInfo.guid, "add", 1, add_time);
-            SetEventValue(charInfo.guid, "logout", 0, 0);
+
+            // Only pay for a DB transaction when a cooldown row actually exists.
+            if (FindEvent(charInfo.guid, PLAYERBOT_EVENT_OFFLINE_COOLDOWN))
+                SetEventValue(charInfo.guid, PLAYERBOT_EVENT_OFFLINE_COOLDOWN, 0, 0);
+
+            retirementDeadlines.erase(charInfo.guid);
             currentBots.insert(charInfo.guid);
+        };
+
+        // Lambda to handle bot login logic
+        auto tryLoginBot = [&](CharacterInfo const& charInfo) -> bool
+        {
+            if (!isEligible(charInfo))
+                return false;
+
+            if (CachedEvent* cooldown = FindEvent(charInfo.guid, PLAYERBOT_EVENT_OFFLINE_COOLDOWN))
+            {
+                if (cooldown->value)
+                {
+                    if (collectCooldownCandidates && collectedCandidates.insert(charInfo.guid).second)
+                        offlineCandidates.push_back({charInfo, cooldown->lastChangeTime});
+
+                    return false;
+                }
+            }
+
+            loginBot(charInfo);
 
             return true;
         };
@@ -797,92 +874,124 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
                 maxAllowedBotCount--;
         }
 
-        // Optional fallback: first expand normal selection to all remaining RNDbot accounts.
-        // Only if no normally eligible bot can fill the remaining slots are active cooldowns bypassed,
-        // oldest logout first.
-        if (maxAllowedBotCount && sPlayerbotAIConfig.enablePeriodicOnlineOffline &&
-            sPlayerbotAIConfig.randomBotOfflineCooldownFallback)
+        // Optional fallback (disabled by default): keep the requested population stable when the
+        // rotating account subset cannot fill it. It touches every RNDbot account, so it is rate
+        // limited rather than run on each manager tick.
+        if (maxAllowedBotCount && collectCooldownCandidates)
         {
-            std::unordered_set<uint32> selectedAccounts(accountsToUse.begin(), accountsToUse.end());
-            std::vector<uint32> additionalAccounts;
-            additionalAccounts.reserve(rndBotTypeAccounts.size());
+            static uint32 nextFallbackRun = 0;
+            uint32 const now = NowSeconds();
 
-            for (uint32 accountId : rndBotTypeAccounts)
+            if (now >= nextFallbackRun)
             {
-                if (!selectedAccounts.contains(accountId))
-                    additionalAccounts.push_back(accountId);
-            }
+                nextFallbackRun = now + PLAYERBOT_OFFLINE_FALLBACK_INTERVAL;
 
-            std::vector<CharacterInfo> additionalCharacters;
-            appendCharactersFromAccounts(additionalAccounts, additionalCharacters);
-            std::shuffle(additionalCharacters.begin(), additionalCharacters.end(), rng);
+                // Step 1: widen the normal selection to the RNDbot accounts that
+                // PeriodicOnlineOfflineRatio left out. Offline cooldowns still apply here.
+                std::unordered_set<uint32> const selectedAccounts(accountsToUse.begin(), accountsToUse.end());
+                std::vector<uint32> additionalAccounts;
+                additionalAccounts.reserve(rndBotTypeAccounts.size());
 
-            // Never break a cooldown while a normally eligible bot still exists elsewhere in the pool.
-            for (CharacterInfo const& charInfo : additionalCharacters)
-            {
-                if (!maxAllowedBotCount)
-                    break;
-
-                if (tryLoginBot(charInfo))
-                    maxAllowedBotCount--;
-            }
-
-            if (maxAllowedBotCount)
-            {
-                struct OfflineCandidate
+                for (uint32 accountId : rndBotTypeAccounts)
                 {
-                    CharacterInfo character;
-                    uint32 offlineSince;
-                };
+                    if (!selectedAccounts.contains(accountId))
+                        additionalAccounts.push_back(accountId);
+                }
 
-                std::vector<OfflineCandidate> offlineCandidates;
-                offlineCandidates.reserve(allCharacters.size() + additionalCharacters.size());
+                std::vector<CharacterInfo> additionalCharacters;
+                appendCharactersFromAccounts(additionalAccounts, additionalCharacters);
+                std::shuffle(additionalCharacters.begin(), additionalCharacters.end(), rng);
 
-                auto collectOfflineCandidates = [&](std::vector<CharacterInfo> const& characters)
+                std::vector<CharacterInfo> additionalAlliance;
+                std::vector<CharacterInfo> additionalHorde;
+
+                for (auto const& charInfo : additionalCharacters)
                 {
-                    for (CharacterInfo const& charInfo : characters)
+                    if (IsAlliance(charInfo.rRace))
+                        additionalAlliance.push_back(charInfo);
+                    else
+                        additionalHorde.push_back(charInfo);
+                }
+
+                // Same three phases as above, so widening the pool cannot skew the faction ratio.
+                for (auto const& charInfo : additionalAlliance)
+                {
+                    if (!allowedAllianceCount || !maxAllowedBotCount)
+                        break;
+
+                    if (tryLoginBot(charInfo))
                     {
-                        if (GetEventValue(charInfo.guid, "add") ||
-                            GetPlayerBot(charInfo.guid) ||
-                            currentBots.contains(charInfo.guid) ||
-                            (sPlayerbotAIConfig.disableDeathKnightLogin && charInfo.rClass == CLASS_DEATH_KNIGHT))
-                        {
-                            continue;
-                        }
-
-                        if (GetEventValue(charInfo.guid, "logout"))
-                        {
-                            if (CachedEvent* logoutEvent = FindEvent(charInfo.guid, "logout"))
-                                offlineCandidates.push_back({charInfo, logoutEvent->lastChangeTime});
-                        }
-                    }
-                };
-
-                collectOfflineCandidates(allCharacters);
-                collectOfflineCandidates(additionalCharacters);
-
-                auto olderOffline = [](OfflineCandidate const& left, OfflineCandidate const& right)
-                {
-                    if (left.offlineSince != right.offlineSince)
-                        return left.offlineSince < right.offlineSince;
-
-                    return left.character.guid < right.character.guid;
-                };
-
-                size_t candidateCount = std::min<size_t>(maxAllowedBotCount, offlineCandidates.size());
-                std::partial_sort(offlineCandidates.begin(), offlineCandidates.begin() + candidateCount,
-                                  offlineCandidates.end(), olderOffline);
-
-                for (size_t i = 0; i < candidateCount && maxAllowedBotCount; ++i)
-                {
-                    OfflineCandidate const& candidate = offlineCandidates[i];
-                    if (tryLoginBot(candidate.character, true))
-                    {
-                        LOG_DEBUG("playerbots",
-                                  "Bot #{} bypassed offline cooldown after {}s offline to maintain requested population",
-                                  candidate.character.guid, NowSeconds() - candidate.offlineSince);
                         maxAllowedBotCount--;
+                        allowedAllianceCount--;
                     }
+                }
+
+                for (auto const& charInfo : additionalHorde)
+                {
+                    if (!maxAllowedBotCount)
+                        break;
+
+                    if (tryLoginBot(charInfo))
+                        maxAllowedBotCount--;
+                }
+
+                for (auto const& charInfo : additionalAlliance)
+                {
+                    if (!maxAllowedBotCount)
+                        break;
+
+                    if (tryLoginBot(charInfo))
+                        maxAllowedBotCount--;
+                }
+
+                // Step 2: every normally eligible bot in the pool is exhausted, so now, and only now,
+                // active cooldowns may be bypassed.
+                if (maxAllowedBotCount && !offlineCandidates.empty())
+                {
+                    // Oldest logout first, GUID as a deterministic tie-break.
+                    std::sort(offlineCandidates.begin(), offlineCandidates.end(),
+                              [](OfflineCandidate const& left, OfflineCandidate const& right)
+                              {
+                                  if (left.offlineSince != right.offlineSince)
+                                      return left.offlineSince < right.offlineSince;
+
+                                  return left.character.guid < right.character.guid;
+                              });
+
+                    // Bypassing runs through the same alliance/horde/alliance phases so the fallback
+                    // keeps the configured faction ratio. Bots taken by an earlier phase fail the
+                    // currentBots check in isEligible(), so no extra bookkeeping is needed.
+                    auto bypassCooldowns = [&](bool alliance, uint32* extraBudget)
+                    {
+                        for (OfflineCandidate const& candidate : offlineCandidates)
+                        {
+                            if (!maxAllowedBotCount || (extraBudget && !*extraBudget))
+                                break;
+
+                            if (alliance != IsAlliance(candidate.character.rRace))
+                                continue;
+
+                            if (!isEligible(candidate.character))
+                                continue;
+
+                            loginBot(candidate.character);
+
+                            LOG_DEBUG("playerbots",
+                                      "Bot #{} bypassed offline cooldown after {}s offline to maintain "
+                                      "requested population",
+                                      candidate.character.guid,
+                                      now > candidate.offlineSince ? now - candidate.offlineSince : 0);
+
+                            maxAllowedBotCount--;
+
+                            if (extraBudget)
+                                (*extraBudget)--;
+                        }
+                    };
+
+                    bypassCooldowns(true, &allowedAllianceCount);
+                    bypassCooldowns(false, nullptr);
+                    bypassCooldowns(true, nullptr);
                 }
             }
         }
@@ -1430,6 +1539,73 @@ void RandomPlayerbotMgr::ScheduleChangeStrategy(uint32 bot, uint32 time)
     SetEventValue(bot, "change_strategy", 1, time);
 }
 
+// Decides whether a random bot whose in-world lifetime expired may be logged out right now.
+// Busy states only delay the logout; a bot that is still busy after PLAYERBOT_RETIREMENT_GRACE_PERIOD
+// is retired anyway, otherwise a permanently grouped or endlessly queued bot would hold its
+// population slot forever. Two cases are waited out without a deadline: a running battleground or
+// arena match, which ends on its own and whose participants should not lose a player, and a group
+// that a human is part of, which is the player's group to break up, not ours.
+bool RandomPlayerbotMgr::IsSafeToRetire(uint32 bot, Player* player, PlayerbotAI* botAI)
+{
+    bool const inMatch = player->InBattleground() || player->InArena();
+    bool const withRealPlayer = GroupHasRealPlayer(player);
+    bool const busy = inMatch || withRealPlayer || player->GetGroup() || player->IsInCombat() ||
+                      player->IsBeingTeleported() || player->HasUnitState(UNIT_STATE_IN_FLIGHT) ||
+                      player->InBattlegroundQueue();
+
+    if (!busy)
+    {
+        retirementDeadlines.erase(bot);
+        return true;
+    }
+
+    uint32 const now = NowSeconds();
+    uint32& deadline = retirementDeadlines.try_emplace(bot, now + PLAYERBOT_RETIREMENT_GRACE_PERIOD).first->second;
+
+    // The grace period only starts running once the bot is no longer needed by others.
+    if (inMatch || withRealPlayer)
+    {
+        deadline = now + PLAYERBOT_RETIREMENT_GRACE_PERIOD;
+        return false;
+    }
+
+    if (now < deadline)
+        return false;
+
+    LOG_DEBUG("playerbots", "Bot #{} stayed busy for {}s past its lifetime and is retired now", bot,
+              PLAYERBOT_RETIREMENT_GRACE_PERIOD);
+
+    // Leaving the group is what stops a bot-only group from blocking the slot indefinitely.
+    if (botAI && player->GetGroup())
+        botAI->LeaveOrDisbandGroup();
+
+    return true;
+}
+
+// Puts a logged out random bot on its offline cooldown. Only meaningful with periodic online/offline
+// enabled; setting MaxRandomBotOfflineTime to 0 turns the cooldown off.
+void RandomPlayerbotMgr::SetOfflineCooldown(uint32 bot)
+{
+    if (!sPlayerbotAIConfig.enablePeriodicOnlineOffline)
+        return;
+
+    // MaxRandomBotOfflineTime is the documented off switch, so it is checked before the two values are
+    // normalised. Otherwise a config with only Max at 0 would still hand out a cooldown.
+    if (!sPlayerbotAIConfig.maxRandomBotOfflineTime)
+        return;
+
+    uint32 const minOfflineTime =
+        std::min(sPlayerbotAIConfig.minRandomBotOfflineTime, sPlayerbotAIConfig.maxRandomBotOfflineTime);
+    uint32 const maxOfflineTime =
+        std::max(sPlayerbotAIConfig.minRandomBotOfflineTime, sPlayerbotAIConfig.maxRandomBotOfflineTime);
+
+    // A validIn of 0 never expires in FindEvent(), which would lock the bot out permanently.
+    uint32 const offlineTime = std::max<uint32>(1, urand(minOfflineTime, maxOfflineTime));
+
+    SetEventValue(bot, PLAYERBOT_EVENT_OFFLINE_COOLDOWN, 1, offlineTime);
+    LOG_DEBUG("playerbots", "Bot #{} entered offline cooldown for {}s", bot, offlineTime);
+}
+
 bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
 {
     ObjectGuid botGUID = ObjectGuid::Create<HighGuid::Player>(bot);
@@ -1439,15 +1615,10 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
     uint32 isValid = GetEventValue(bot, "add");
     if (!isValid)
     {
-        // Keep an expired bot online until it is safe to retire. The expired "add" event remains
-        // absent, so a later manager pass retries retirement without extending its online lifetime.
-        if (player &&
-            (player->GetGroup() || player->IsInCombat() || player->IsBeingTeleported() ||
-             player->HasUnitState(UNIT_STATE_IN_FLIGHT) || player->InBattleground() || player->InArena() ||
-             player->InBattlegroundQueue()))
-        {
+        // Keep an expired bot online until it is safe to retire. The expired "add" event stays absent,
+        // so a later manager pass retries retirement without extending its online lifetime.
+        if (player && !IsSafeToRetire(bot, player, botAI))
             return false;
-        }
 
         if (player)
             LOG_DEBUG("playerbots", "Bot #{} {}:{} <{}>: log out", bot, IsAlliance(player->getRace()) ? "A" : "H",
@@ -1457,21 +1628,11 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
 
         SetEventValue(bot, "add", 0, 0);
         currentBots.erase(bot);
+        retirementDeadlines.erase(bot);
 
         if (player)
         {
-            if (sPlayerbotAIConfig.enablePeriodicOnlineOffline && sPlayerbotAIConfig.maxRandomBotOfflineTime)
-            {
-                uint32 minOfflineTime =
-                    std::min(sPlayerbotAIConfig.minRandomBotOfflineTime, sPlayerbotAIConfig.maxRandomBotOfflineTime);
-                uint32 maxOfflineTime =
-                    std::max(sPlayerbotAIConfig.minRandomBotOfflineTime, sPlayerbotAIConfig.maxRandomBotOfflineTime);
-                uint32 offlineTime = urand(minOfflineTime, maxOfflineTime);
-
-                SetEventValue(bot, "logout", 1, offlineTime);
-                LOG_DEBUG("playerbots", "Bot #{} entered offline cooldown for {}s", bot, offlineTime);
-            }
-
+            SetOfflineCooldown(bot);
             LogoutPlayerBot(botGUID);
         }
 
@@ -1867,6 +2028,10 @@ void RandomPlayerbotMgr::Init()
         sRandomPlayerbotMgr.LoadBattleMastersCache();
 
     PlayerbotsDatabase.Execute("DELETE FROM playerbots_random_bots WHERE event = 'add'");
+
+    // 'logout' rows are written by Randomize()/RandomizeMin() and were left behind by older versions.
+    // They never meant an offline cooldown, so drop them instead of letting them lock bots out.
+    PlayerbotsDatabase.Execute("DELETE FROM playerbots_random_bots WHERE event = 'logout'");
 }
 
 void RandomPlayerbotMgr::InitArenaTeams()
@@ -2851,6 +3016,11 @@ void RandomPlayerbotMgr::OnPlayerLoginError(uint32 bot)
 {
     SetEventValue(bot, "add", 0, 0);
     currentBots.erase(bot);
+    retirementDeadlines.erase(bot);
+
+    // Without a short cooldown a character that cannot be loaded is picked again on the very next
+    // tick, and keeps failing in a loop.
+    SetEventValue(bot, PLAYERBOT_EVENT_OFFLINE_COOLDOWN, 1, PLAYERBOT_LOGIN_ERROR_COOLDOWN);
 }
 
 Player* RandomPlayerbotMgr::GetRandomPlayer()
@@ -3238,6 +3408,7 @@ void RandomPlayerbotMgr::Remove(Player* bot)
 
     uint32 botId = owner.GetCounter();
     eventCache.erase(botId);
+    retirementDeadlines.erase(botId);
 
     LogoutPlayerBot(owner);
 }
