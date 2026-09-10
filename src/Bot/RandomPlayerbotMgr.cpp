@@ -739,6 +739,7 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
         {
             if (GetEventValue(charInfo.guid, "add") ||
                 GetEventValue(charInfo.guid, "logout") ||
+                GetEventValue(charInfo.guid, "offline_cd") ||
                 GetPlayerBot(charInfo.guid) ||
                 currentBots.contains(charInfo.guid) ||
                 (sPlayerbotAIConfig.disableDeathKnightLogin && charInfo.rClass == CLASS_DEATH_KNIGHT))
@@ -753,6 +754,7 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
 
             SetEventValue(charInfo.guid, "add", 1, add_time);
             SetEventValue(charInfo.guid, "logout", 0, 0);
+            SetEventValue(charInfo.guid, "offline_cd", 0, 0);
             currentBots.insert(charInfo.guid);
 
             return true;
@@ -1334,6 +1336,28 @@ void RandomPlayerbotMgr::ScheduleChangeStrategy(uint32 bot, uint32 time)
     SetEventValue(bot, "change_strategy", 1, time);
 }
 
+// A random bot whose in-world lifetime expired must not be yanked out of the world while it is
+// still busy. Retirement is deferred until the bot is idle enough to disappear unnoticed.
+static bool IsRandomBotReadyToRetire(Player* player)
+{
+    if (player->GetGroup())
+        return false;
+
+    if (player->IsInCombat())
+        return false;
+
+    if (player->IsBeingTeleported())
+        return false;
+
+    if (player->IsInFlight() || player->HasUnitState(UNIT_STATE_IN_FLIGHT))
+        return false;
+
+    if (player->InBattleground() || player->InArena() || player->InBattlegroundQueue())
+        return false;
+
+    return true;
+}
+
 bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
 {
     ObjectGuid botGUID = ObjectGuid::Create<HighGuid::Player>(bot);
@@ -1343,7 +1367,9 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
     uint32 isValid = GetEventValue(bot, "add");
     if (!isValid)
     {
-        if (!player || !player->GetGroup())
+        // The expired "add" event is deliberately left expired while retirement is deferred, so
+        // every following manager pass re-enters this branch and retries until the bot is idle.
+        if (!player || IsRandomBotReadyToRetire(player))
         {
             if (player)
                 LOG_DEBUG("playerbots", "Bot #{} {}:{} <{}>: log out", bot, IsAlliance(player->getRace()) ? "A" : "H",
@@ -1352,6 +1378,10 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
                 LOG_DEBUG("playerbots", "Bot #{}: log out", bot);
 
             SetEventValue(bot, "add", 0, 0);
+            // Keep the bot out of AddRandomBots() selection until its offline cooldown expires.
+            SetEventValue(
+                bot, "offline_cd", 1,
+                urand(sPlayerbotAIConfig.minRandomBotOfflineTime, sPlayerbotAIConfig.maxRandomBotOfflineTime));
             currentBots.erase(bot);
 
             if (player)
@@ -1424,18 +1454,6 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
         randomTime = urand(sPlayerbotAIConfig.minRandomBotReviveTime, sPlayerbotAIConfig.maxRandomBotReviveTime);
         SetEventValue(bot, "update", 1, randomTime);
 
-        return true;
-    }
-
-    uint32 logout = GetEventValue(bot, "logout");
-    if (player && !logout && !isValid)
-    {
-        LOG_DEBUG("playerbots", "Bot #{} {}:{} <{}>: log out", bot, IsAlliance(player->getRace()) ? "A" : "H",
-                  player->GetLevel(), player->GetName().c_str());
-        LogoutPlayerBot(botGUID);
-        currentBots.erase(bot);
-        SetEventValue(bot, "logout", 1,
-                      urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime));
         return true;
     }
 

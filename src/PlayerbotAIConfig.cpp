@@ -251,6 +251,13 @@ bool PlayerbotAIConfig::Initialize()
         sConfigMgr->GetOption<int32>("AiPlayerbot.RandomBotCountChangeMaxInterval", 2 * HOUR);
     minRandomBotInWorldTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MinRandomBotInWorldTime", 2 * HOUR);
     maxRandomBotInWorldTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MaxRandomBotInWorldTime", 14 * 24 * HOUR);
+    // Offline cooldown applied after a random bot's in-world lifetime expires. Defaults to the
+    // in-world times so that configs predating these options keep their previous behaviour.
+    minRandomBotOfflineTime =
+        sConfigMgr->GetOption<int32>("AiPlayerbot.MinRandomBotOfflineTime", minRandomBotInWorldTime);
+    maxRandomBotOfflineTime =
+        sConfigMgr->GetOption<int32>("AiPlayerbot.MaxRandomBotOfflineTime", maxRandomBotInWorldTime);
+    maxRandomBotOfflineTime = std::max(maxRandomBotOfflineTime, minRandomBotOfflineTime);
     minRandomBotRandomizeTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MinRandomBotRandomizeTime", 2 * HOUR);
     maxRandomBotRandomizeTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MaxRandomBotRandomizeTime", 14 * 24 * HOUR);
     minRandomBotChangeStrategyTime =
