@@ -697,26 +697,32 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
         };
         std::vector<CharacterInfo> allCharacters;
 
-        for (uint32 accountId : accountsToUse)
+        auto appendCharactersFromAccounts = [&](std::vector<uint32> const& accounts,
+                                                std::vector<CharacterInfo>& characters)
         {
-            CharacterDatabasePreparedStatement* stmt =
-                CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARS_BY_ACCOUNT_ID);
-            stmt->SetData(0, accountId);
-            PreparedQueryResult result = CharacterDatabase.Query(stmt);
-            if (!result)
-                continue;
-
-            do
+            for (uint32 accountId : accounts)
             {
-                Field* fields = result->Fetch();
-                CharacterInfo info;
-                info.guid = fields[0].Get<uint32>();
-                info.rClass = fields[1].Get<uint8>();
-                info.rRace = fields[2].Get<uint8>();
-                info.accountId = accountId;
-                allCharacters.push_back(info);
-            } while (result->NextRow());
-        }
+                CharacterDatabasePreparedStatement* stmt =
+                    CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARS_BY_ACCOUNT_ID);
+                stmt->SetData(0, accountId);
+                PreparedQueryResult result = CharacterDatabase.Query(stmt);
+                if (!result)
+                    continue;
+
+                do
+                {
+                    Field* fields = result->Fetch();
+                    CharacterInfo info;
+                    info.guid = fields[0].Get<uint32>();
+                    info.rClass = fields[1].Get<uint8>();
+                    info.rRace = fields[2].Get<uint8>();
+                    info.accountId = accountId;
+                    characters.push_back(info);
+                } while (result->NextRow());
+            }
+        };
+
+        appendCharactersFromAccounts(accountsToUse, allCharacters);
 
         // Shuffle for class balance
         std::shuffle(allCharacters.begin(), allCharacters.end(), rng);
@@ -735,10 +741,10 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
         }
 
         // Lambda to handle bot login logic
-        auto tryLoginBot = [&](CharacterInfo const& charInfo) -> bool
+        auto tryLoginBot = [&](CharacterInfo const& charInfo, bool ignoreOfflineCooldown = false) -> bool
         {
             if (GetEventValue(charInfo.guid, "add") ||
-                GetEventValue(charInfo.guid, "logout") ||
+                (!ignoreOfflineCooldown && GetEventValue(charInfo.guid, "logout")) ||
                 GetPlayerBot(charInfo.guid) ||
                 currentBots.contains(charInfo.guid) ||
                 (sPlayerbotAIConfig.disableDeathKnightLogin && charInfo.rClass == CLASS_DEATH_KNIGHT))
@@ -789,6 +795,96 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
 
             if (tryLoginBot(charInfo))
                 maxAllowedBotCount--;
+        }
+
+        // Optional fallback: first expand normal selection to all remaining RNDbot accounts.
+        // Only if no normally eligible bot can fill the remaining slots are active cooldowns bypassed,
+        // oldest logout first.
+        if (maxAllowedBotCount && sPlayerbotAIConfig.enablePeriodicOnlineOffline &&
+            sPlayerbotAIConfig.randomBotOfflineCooldownFallback)
+        {
+            std::unordered_set<uint32> selectedAccounts(accountsToUse.begin(), accountsToUse.end());
+            std::vector<uint32> additionalAccounts;
+            additionalAccounts.reserve(rndBotTypeAccounts.size());
+
+            for (uint32 accountId : rndBotTypeAccounts)
+            {
+                if (!selectedAccounts.contains(accountId))
+                    additionalAccounts.push_back(accountId);
+            }
+
+            std::vector<CharacterInfo> additionalCharacters;
+            appendCharactersFromAccounts(additionalAccounts, additionalCharacters);
+            std::shuffle(additionalCharacters.begin(), additionalCharacters.end(), rng);
+
+            // Never break a cooldown while a normally eligible bot still exists elsewhere in the pool.
+            for (CharacterInfo const& charInfo : additionalCharacters)
+            {
+                if (!maxAllowedBotCount)
+                    break;
+
+                if (tryLoginBot(charInfo))
+                    maxAllowedBotCount--;
+            }
+
+            if (maxAllowedBotCount)
+            {
+                struct OfflineCandidate
+                {
+                    CharacterInfo character;
+                    uint32 offlineSince;
+                };
+
+                std::vector<OfflineCandidate> offlineCandidates;
+                offlineCandidates.reserve(allCharacters.size() + additionalCharacters.size());
+
+                auto collectOfflineCandidates = [&](std::vector<CharacterInfo> const& characters)
+                {
+                    for (CharacterInfo const& charInfo : characters)
+                    {
+                        if (GetEventValue(charInfo.guid, "add") ||
+                            GetPlayerBot(charInfo.guid) ||
+                            currentBots.contains(charInfo.guid) ||
+                            (sPlayerbotAIConfig.disableDeathKnightLogin && charInfo.rClass == CLASS_DEATH_KNIGHT))
+                        {
+                            continue;
+                        }
+
+                        if (GetEventValue(charInfo.guid, "logout"))
+                        {
+                            if (CachedEvent* logoutEvent = FindEvent(charInfo.guid, "logout"))
+                                offlineCandidates.push_back({charInfo, logoutEvent->lastChangeTime});
+                        }
+                    }
+                };
+
+                collectOfflineCandidates(allCharacters);
+                collectOfflineCandidates(additionalCharacters);
+
+                auto olderOffline = [](OfflineCandidate const& left, OfflineCandidate const& right)
+                {
+                    if (left.offlineSince != right.offlineSince)
+                        return left.offlineSince < right.offlineSince;
+
+                    return left.character.guid < right.character.guid;
+                };
+
+                size_t candidateCount = std::min<size_t>(maxAllowedBotCount, offlineCandidates.size());
+                std::partial_sort(offlineCandidates.begin(), offlineCandidates.begin() + candidateCount,
+                                  offlineCandidates.end(), olderOffline);
+
+                for (size_t i = 0; i < candidateCount && maxAllowedBotCount; ++i)
+                {
+                    OfflineCandidate const& candidate = offlineCandidates[i];
+                    if (tryLoginBot(candidate.character, true))
+                    {
+                        LOG_DEBUG("playerbots",
+                                  "Bot #{} bypassed offline cooldown after {}s offline to maintain requested population",
+                                  candidate.character.guid, NowSeconds() - candidate.offlineSince);
+                        maxAllowedBotCount--;
+                    }
+                }
+            }
         }
 
         // PHASE 4: An error is given if maxAllowedBotCount is still not reached
@@ -1343,19 +1439,40 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
     uint32 isValid = GetEventValue(bot, "add");
     if (!isValid)
     {
-        if (!player || !player->GetGroup())
+        // Keep an expired bot online until it is safe to retire. The expired "add" event remains
+        // absent, so a later manager pass retries retirement without extending its online lifetime.
+        if (player &&
+            (player->GetGroup() || player->IsInCombat() || player->IsBeingTeleported() ||
+             player->HasUnitState(UNIT_STATE_IN_FLIGHT) || player->InBattleground() || player->InArena() ||
+             player->InBattlegroundQueue()))
         {
-            if (player)
-                LOG_DEBUG("playerbots", "Bot #{} {}:{} <{}>: log out", bot, IsAlliance(player->getRace()) ? "A" : "H",
-                          player->GetLevel(), player->GetName().c_str());
-            else
-                LOG_DEBUG("playerbots", "Bot #{}: log out", bot);
+            return false;
+        }
 
-            SetEventValue(bot, "add", 0, 0);
-            currentBots.erase(bot);
+        if (player)
+            LOG_DEBUG("playerbots", "Bot #{} {}:{} <{}>: log out", bot, IsAlliance(player->getRace()) ? "A" : "H",
+                      player->GetLevel(), player->GetName().c_str());
+        else
+            LOG_DEBUG("playerbots", "Bot #{}: log out", bot);
 
-            if (player)
-                LogoutPlayerBot(botGUID);
+        SetEventValue(bot, "add", 0, 0);
+        currentBots.erase(bot);
+
+        if (player)
+        {
+            if (sPlayerbotAIConfig.enablePeriodicOnlineOffline && sPlayerbotAIConfig.maxRandomBotOfflineTime)
+            {
+                uint32 minOfflineTime =
+                    std::min(sPlayerbotAIConfig.minRandomBotOfflineTime, sPlayerbotAIConfig.maxRandomBotOfflineTime);
+                uint32 maxOfflineTime =
+                    std::max(sPlayerbotAIConfig.minRandomBotOfflineTime, sPlayerbotAIConfig.maxRandomBotOfflineTime);
+                uint32 offlineTime = urand(minOfflineTime, maxOfflineTime);
+
+                SetEventValue(bot, "logout", 1, offlineTime);
+                LOG_DEBUG("playerbots", "Bot #{} entered offline cooldown for {}s", bot, offlineTime);
+            }
+
+            LogoutPlayerBot(botGUID);
         }
 
         return false;
@@ -1424,18 +1541,6 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
         randomTime = urand(sPlayerbotAIConfig.minRandomBotReviveTime, sPlayerbotAIConfig.maxRandomBotReviveTime);
         SetEventValue(bot, "update", 1, randomTime);
 
-        return true;
-    }
-
-    uint32 logout = GetEventValue(bot, "logout");
-    if (player && !logout && !isValid)
-    {
-        LOG_DEBUG("playerbots", "Bot #{} {}:{} <{}>: log out", bot, IsAlliance(player->getRace()) ? "A" : "H",
-                  player->GetLevel(), player->GetName().c_str());
-        LogoutPlayerBot(botGUID);
-        currentBots.erase(bot);
-        SetEventValue(bot, "logout", 1,
-                      urand(sPlayerbotAIConfig.minRandomBotInWorldTime, sPlayerbotAIConfig.maxRandomBotInWorldTime));
         return true;
     }
 

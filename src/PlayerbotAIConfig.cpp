@@ -251,6 +251,12 @@ bool PlayerbotAIConfig::Initialize()
         sConfigMgr->GetOption<int32>("AiPlayerbot.RandomBotCountChangeMaxInterval", 2 * HOUR);
     minRandomBotInWorldTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MinRandomBotInWorldTime", 2 * HOUR);
     maxRandomBotInWorldTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MaxRandomBotInWorldTime", 14 * 24 * HOUR);
+    minRandomBotOfflineTime =
+        sConfigMgr->GetOption<int32>("AiPlayerbot.MinRandomBotOfflineTime", minRandomBotInWorldTime);
+    maxRandomBotOfflineTime =
+        sConfigMgr->GetOption<int32>("AiPlayerbot.MaxRandomBotOfflineTime", maxRandomBotInWorldTime);
+    randomBotOfflineCooldownFallback =
+        sConfigMgr->GetOption<bool>("AiPlayerbot.RandomBotOfflineCooldownFallback", false);
     minRandomBotRandomizeTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MinRandomBotRandomizeTime", 2 * HOUR);
     maxRandomBotRandomizeTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MaxRandomBotRandomizeTime", 14 * 24 * HOUR);
     minRandomBotChangeStrategyTime =
